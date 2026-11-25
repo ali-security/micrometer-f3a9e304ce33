@@ -61,8 +61,13 @@ class JerseyKeyValues {
      * @return the method KeyValue whose value is a capitalized method (e.g. GET).
      */
     static KeyValue method(ContainerRequest request) {
-        return (request != null)
-                ? JerseyObservationDocumentation.JerseyLegacyLowCardinalityTags.METHOD.withValue(request.getMethod())
+        if (request == null) {
+            return METHOD_UNKNOWN;
+        }
+
+        String method = request.getMethod();
+        return HttpMethods.isStandard(method)
+                ? JerseyObservationDocumentation.JerseyLegacyLowCardinalityTags.METHOD.withValue(method)
                 : METHOD_UNKNOWN;
     }
 

@@ -68,7 +68,12 @@ public final class JerseyTags {
      * @return the method tag whose value is a capitalized method (e.g. GET).
      */
     public static Tag method(ContainerRequest request) {
-        return (request != null) ? Tag.of("method", request.getMethod()) : METHOD_UNKNOWN;
+        if (request == null) {
+            return METHOD_UNKNOWN;
+        }
+
+        String method = request.getMethod();
+        return HttpMethods.isStandard(method) ? Tag.of("method", method) : METHOD_UNKNOWN;
     }
 
     /**
