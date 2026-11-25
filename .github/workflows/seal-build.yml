@@ -1,0 +1,191 @@
+name: seal-build
+
+# Upstream builds and tests on CircleCI only (.circleci/config.yml: cimg/openjdk:21.0.9,
+# `./gradlew build` plus `./gradlew dockerTest` on a machine executor); its GitHub
+# workflows neither build nor test. This workflow runs micrometer-core's unit and
+# docker-tagged test suites on the release JDK (Temurin 21.0.9, per the published
+# MANIFEST), the suites of the other modules whose sources the CVE patches touch
+# (micrometer-registry-statsd, micrometer-jetty12), and packs the micrometer-core jar.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test selector (e.g. ":micrometer-core:test --tests FooTest"); empty runs the full suite'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2g -XX:+HeapDumpOnOutOfMemoryError" -Dorg.gradle.workers.max=4'
+      GRADLE_FLAGS: >-
+        --no-daemon --console=plain --stacktrace --no-build-cache
+        -I ${{ github.workspace }}/../test-logging.gradle
+        -Prelease.version=1.15.10 -Prelease.stage=final -Prelease.disableGitChecks=true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.9'
+          cache: gradle
+
+      - name: Write Gradle test-logging init script
+        run: |
+          cat > "${{ github.workspace }}/../test-logging.gradle" <<'EOF'
+          def outcomeLock = new Object()
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  def outcomeFile = new File(t.project.rootDir, 'build/seal-test-outcomes.tsv')
+                  afterTest { desc, result ->
+                      def clean = { String v -> (v ?: '').replaceAll('[\\t\\r\\n]+', ' ') }
+                      def msg = result.exception ? clean(result.exception.message) : ''
+                      def line = [t.path, desc.className, clean(desc.parent?.name), clean(desc.name), result.resultType.toString(), msg].join('\t')
+                      synchronized (outcomeLock) {
+                          outcomeFile.parentFile.mkdirs()
+                          outcomeFile << line + '\n'
+                      }
+                  }
+                  testLogging {
+                      events 'skipped', 'failed'
+                      exceptionFormat 'full'
+                  }
+                  afterSuite { desc, result ->
+                      if (!desc.parent) {
+                          println "TEST SUMMARY ${t.path}: ${result.resultType} - ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Test and build micrometer-core
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_FLAGS ${{ inputs.test-filter }} :micrometer-core:jar
+          else
+            ./gradlew $GRADLE_FLAGS \
+              :micrometer-core:test :micrometer-core:dockerTest \
+              :micrometer-registry-statsd:test :micrometer-jetty12:test \
+              :micrometer-core:jar
+          fi
+
+      - name: Test results summary and skipped tests with their reasons
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          from collections import OrderedDict
+
+          SKIP_RE = re.compile(r'@Disabled|@Enabled|assume(True|False|That)')
+          SIG_RE = re.compile(r'\b(?:void|fun)\s+`?(\w+)')
+          sources = {}
+          for f in glob.glob('**/src/*/java/**/*.java', recursive=True) + glob.glob('**/src/*/kotlin/**/*.kt', recursive=True):
+              sources.setdefault(os.path.splitext(os.path.basename(f))[0], f)
+
+          def parse(cls):
+              path = sources.get(cls)
+              if not path:
+                  return None
+              lines = open(path, encoding='utf-8').read().splitlines()
+              methods, class_annos, superclass, pending, current = {}, [], None, [], None
+              for i, line in enumerate(lines):
+                  st = line.strip()
+                  m = re.search(r'\bclass\s+' + cls + r'\b(.*)', st)
+                  if m and current is None:
+                      class_annos = [a for a in pending if SKIP_RE.search(a)]
+                      decl = m.group(1)
+                      j = i
+                      while '{' not in decl and j + 1 < len(lines):
+                          j += 1
+                          decl += ' ' + lines[j].strip()
+                      sm = re.search(r'extends\s+(\w+)', decl)
+                      superclass = sm.group(1) if sm else None
+                      pending = []
+                      continue
+                  sig = SIG_RE.search(st)
+                  if sig and not st.startswith('//'):
+                      current = sig.group(1)
+                      methods[current] = [a for a in pending if SKIP_RE.search(a)]
+                      pending = []
+                      continue
+                  if st.startswith(('//', '/*', '*')):
+                      pass
+                  elif st.startswith('@'):
+                      pending.append(st)
+                  elif pending and st and not st.startswith(('//', '/*', '*')) and not st.endswith(('{', '}', ';')):
+                      pending[-1] += ' ' + st
+                  elif st:
+                      pending = []
+                  if current and re.search(r'assume(True|False|That)\(', st):
+                      methods[current].append(st)
+              return methods, class_annos, superclass
+
+          def reason(cls_fqn, name):
+              cls = cls_fqn.split('.')[-1].split('$')[-1]
+              method = re.match(r'(\w+)', name)
+              method = method.group(1) if method and not name.startswith('[') else None
+              hierarchy, c = [], cls
+              while c and len(hierarchy) < 6:
+                  info = parse(c)
+                  if not info:
+                      break
+                  hierarchy.append((c, info))
+                  c = info[2]
+              for c, (methods, class_annos, _) in hierarchy:
+                  if method and methods.get(method):
+                      return f'{c}.{method}: ' + ' '.join(methods[method])
+              for c, (methods, class_annos, _) in hierarchy:
+                  if class_annos:
+                      return f'class-level on {c}: ' + ' '.join(class_annos)
+              if not method:
+                  disabled = [f'{c}.{m}: ' + ' '.join(a) for c, (ms, _, _) in hierarchy for m, a in ms.items() if any('@Disabled' in x for x in a)]
+                  if disabled:
+                      return 'parameterized invocation of a disabled test - ' + '; '.join(disabled)
+              return 'no reason found in source'
+
+          outcomes = OrderedDict()
+          tsv = 'build/seal-test-outcomes.tsv'
+          with open(tsv if os.path.exists(tsv) else os.devnull, encoding='utf-8') as fh:
+              for row in fh:
+                  task, cls, parent, name, result, msg = (row.rstrip('\n').split('\t') + [''] * 6)[:6]
+                  key = (task, cls, parent if name.startswith('[') else '', name)
+                  outcomes.setdefault(key, []).append((result, msg))
+
+          totals = OrderedDict()
+          skipped, retried = [], []
+          for (task, cls, parent, name), recs in outcomes.items():
+              results = [r for r, _ in recs]
+              final = 'passed' if 'SUCCESS' in results else ('failed' if 'FAILURE' in results else 'skipped')
+              if 'FAILURE' in results and final == 'passed':
+                  retried.append(f'PASSED ON RETRY {task} {cls}.{parent + " " if parent else ""}{name}')
+              t = totals.setdefault(task, {'tests': 0, 'passed': 0, 'failed': 0, 'skipped': 0})
+              t['tests'] += 1
+              t[final] += 1
+              if final == 'skipped':
+                  label = f'{parent} {name}' if parent else name
+                  why = reason(cls, parent if parent else name)
+                  msg = recs[-1][1]
+                  if msg:
+                      why = f'{msg} ({why})'
+                  skipped.append(f'SKIPPED TEST {task} {cls}.{label} - reason: {why}')
+          for line in retried + skipped:
+              print(line)
+          grand = {'tests': 0, 'passed': 0, 'failed': 0, 'skipped': 0}
+          for k, t in sorted(totals.items()):
+              print(f"RESULTS {k}: {t['tests']} tests, {t['passed']} passed, {t['failed']} failed, {t['skipped']} skipped")
+              for x in grand:
+                  grand[x] += t[x]
+          print(f"RESULTS TOTAL: {grand['tests']} tests, {grand['passed']} passed, {grand['failed']} failed, {grand['skipped']} skipped")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: micrometer-core-jar
+          path: micrometer-core/build/libs/micrometer-core-1.15.10.jar
+          if-no-files-found: error

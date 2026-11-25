@@ -37,6 +37,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Testing Jetty 12 TimedHandler
@@ -118,12 +119,15 @@ class TimedHandlerTest {
             assertThat(response2.getStatus()).isEqualTo(HttpStatus.OK_200);
             assertThat(response2.getContent()).isEmpty();
 
-            assertThat(registry.get("jetty.server.requests")
-                .tag("outcome", Outcome.SUCCESS.name())
-                .tag("method", "GET")
-                .tag("status", "200")
-                .timer()
-                .count()).isEqualTo(2);
+            // The timer is recorded when the response callback completes, which can
+            // happen after the responses have been read; wait for both recordings.
+            await().atMost(5, TimeUnit.SECONDS)
+                .untilAsserted(() -> assertThat(registry.get("jetty.server.requests")
+                    .tag("outcome", Outcome.SUCCESS.name())
+                    .tag("method", "GET")
+                    .tag("status", "200")
+                    .timer()
+                    .count()).isEqualTo(2));
         }
     }
 
